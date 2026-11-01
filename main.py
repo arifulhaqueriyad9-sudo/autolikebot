@@ -38,6 +38,7 @@ from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8823280270:AAF-auB09iS2j4mBRFOfQhN2cXYAdNLiL80").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6417430059"))
@@ -45,6 +46,7 @@ API_URL = "https://autolike-api-frexy.vercel.app/like?"
 OWNER_URL = "https://t.me/Frexy1only"
 WEBSITE_URL = "https://fx-like-bd.vercel.app"
 LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "-1003765179070"))
+# By default, only the log group is authorized to run public like/order commands.
 AUTHORIZED_GROUP_ID = int(os.getenv("AUTHORIZED_GROUP_ID", str(LOG_CHAT_ID)))
 TZ = ZoneInfo("Asia/Dhaka")
 DATA_DIR = BASE_DIR / "bot_data"
@@ -100,7 +102,7 @@ _EMOJI_DECK = []
 _LAST_EMOJI_ID = None
 
 def next_custom_emoji(exclude_ids=None):
-    """Return a rotating premium emoji tag."""
+    """Return a rotating premium emoji tag; never hard-code one emoji for every call."""
     global _EMOJI_DECK, _LAST_EMOJI_ID
     exclude_ids = set(exclude_ids or ())
     if not _EMOJI_DECK:
@@ -150,11 +152,22 @@ def set_public(enabled):
 def is_owner(update):
     return bool(update.effective_user and update.effective_user.id == ADMIN_ID)
 
+def is_authorized_group(update):
+    chat = update.effective_chat
+    return bool(chat and chat.type in ("group", "supergroup") and chat.id == AUTHORIZED_GROUP_ID)
+
+def allowed(update):
+    return is_owner(update) or (is_authorized_group(update) and public_enabled())
+
 def estimate_days(likes):
     return max(1, (max(0, int(likes)) + 199) // 200)
 
+def mask_uid(uid):
+    uid = str(uid)
+    return ("•" * max(0, len(uid) - 4)) + uid[-4:]
+
 def format_message(text):
-    """Format messages line by line with premium emojis."""
+    """Format messages with different premium emoji tags on the heading and detail lines."""
     raw_lines = [line.rstrip() for line in str(text).splitlines()]
     while raw_lines and not raw_lines[0].strip():
         raw_lines.pop(0)
@@ -183,9 +196,10 @@ def format_message(text):
     return f"<blockquote>{heading_emoji} <b>{heading}</b></blockquote>"
 
 async def reply(update, text):
-    """Reply strictly to ADMIN only."""
-    if not update or not update.message:
+    """Try decorated HTML, then fall back to plain text if Telegram rejects custom emoji/HTML."""
+    if not update.message:
         return
+    # Admin sara karo reply dibe na
     if not is_owner(update):
         return
     try:
@@ -200,6 +214,27 @@ async def reply(update, text):
             await update.message.reply_text(str(text), disable_web_page_preview=True)
         except Exception:
             logger.exception("Plain-text reply also failed")
+
+async def send_log(context, text):
+    if not LOG_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=LOG_CHAT_ID,
+            text=format_message(text),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.warning("Formatted log failed (%s); retrying as plain text", type(exc).__name__)
+        try:
+            await context.bot.send_message(
+                chat_id=LOG_CHAT_ID,
+                text=str(text),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception("Plain-text log send also failed")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled Telegram update error", exc_info=context.error)
@@ -252,30 +287,51 @@ def next_day_start():
     return target.isoformat()
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update) or not update.message:
+    if not update.message or not update.effective_user:
         return
-    await reply(update,
-        "FX FF LIKE BD — OWNER START\n\n"
-        "/like UID — manual like\n"
-        "/order UID LIKE_AMOUNT — schedule auto-like (Up to 20k)\n"
-        "/orderlist — view all orders\n"
-        "/admin — admin commands\n/help — all commands"
-    )
+    if is_owner(update):
+        await reply(update,
+            "FX FF LIKE BD — OWNER START\n\n"
+            "/like UID — manual like (private chat allowed)\n"
+            "/order UID LIKE_AMOUNT — schedule auto-like\n"
+            "/orderlist — view all orders\n"
+            "/admin — admin commands\n/help — all commands"
+        )
+    elif is_authorized_group(update):
+        await reply(update, "FX FF LIKE BD\nUse /help to see commands.\nLikes are available only in this authorized group.")
+    else:
+        await reply(
+            update,
+            "FX FF LIKE BD\n\nTo get Free Fire likes, visit our website or contact the admin.\n"
+            f"Website: {WEBSITE_URL}\nAdmin: {OWNER_URL}\n\n"
+            "Like commands work only in the authorized group."
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update) or not update.message:
+    if not update.message or not update.effective_user:
         return
-    await reply(update,
-        "FX FF LIKE BD — HELP\n\n"
-        "/like UID — send likes once\n"
-        "/order UID LIKE_AMOUNT — queue scheduled likes (1 - 20000)\n"
-        "/orderlist — view all orders\n"
-        "/admin — owner admin panel\n\n"
-        f"Website: {WEBSITE_URL}\nAdmin: {OWNER_URL}"
-    )
+    if is_owner(update):
+        await reply(update,
+            "FX FF LIKE BD — HELP\n\n"
+            "/like UID — send likes once (authorized group)\n"
+            "/order UID LIKE_AMOUNT — queue scheduled likes\n"
+            "/orderlist — view all orders\n"
+            "/help — show this help\n"
+            "/admin — owner admin commands\n\n"
+            f"Website: {WEBSITE_URL}\nAdmin: {OWNER_URL}"
+        )
+    elif is_authorized_group(update) and public_enabled():
+        await reply(update,
+            "FX FF LIKE BD — HELP\n\n"
+            "/like UID\nExample: /like 123456789\n"
+            "/order UID LIKE_AMOUNT\nExample: /order 123456789 600\n\n"
+            "Each user can use /like once. For help, contact the admin."
+        )
+    else:
+        await reply(update, f"For likes, visit {WEBSITE_URL} or contact {OWNER_URL}. Commands work only in the authorized group.")
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update) or not update.message:
+    if not update.message or not is_owner(update):
         return
     await reply(update,
         "FX FF LIKE BD — ADMIN PANEL\n\n"
@@ -284,6 +340,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/orderremove UID — remove pending orders for UID\n"
         "/orderlist — show all orders\n"
         "/resetlike USER_ID — allow a user to use /like again\n"
+        "/admin — show this panel\n\n"
         f"Authorized group ID: {AUTHORIZED_GROUP_ID}"
     )
 
@@ -304,22 +361,42 @@ async def public_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update) or not update.message:
         return
     set_public(True)
-    await reply(update, f"PUBLIC MODE ON\nAuthorized group ID: {AUTHORIZED_GROUP_ID}")
+    await reply(update, f"PUBLIC MODE ON\nPublic commands are enabled only in authorized group {AUTHORIZED_GROUP_ID}.")
 
 async def offpublic_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update) or not update.message:
         return
     set_public(False)
-    await reply(update, "PUBLIC MODE OFF\nOnly owner commands enabled.")
+    await reply(update, "PUBLIC MODE OFF\nOnly the owner can use commands until public mode is enabled again.")
 
 async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update) or not update.message:
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if not is_owner(update) and not is_authorized_group(update):
+        await reply(update, f"Use this command only in the authorized group.\nWebsite: {WEBSITE_URL}\nAdmin: {OWNER_URL}")
+        return
+    if not allowed(update):
+        await reply(update, "Public mode is currently OFF. Please contact the admin.")
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
         await reply(update, "Incorrect command format.\nCorrect: /like UID\nExample: /like 123456789")
         return
     uid = context.args[0]
-    data = await send_like_api(uid)
+    used = read_json(USED_LIKES_FILE, {})
+    user_key = str(user.id)
+    if not is_owner(update) and user_key in used:
+        await reply(update, "You have already used your one /like request. Please contact the admin for help.")
+        return
+    async with ORDER_LOCK:
+        used = read_json(USED_LIKES_FILE, {})
+        if not is_owner(update) and user_key in used:
+            await reply(update, "You have already used your one /like request. Please contact the admin for help.")
+            return
+        data = await send_like_api(uid)
+        if api_succeeded(data) and not is_owner(update):
+            used[user_key] = {"uid": uid, "used_at": datetime.now(TZ).isoformat()}
+            write_json(USED_LIKES_FILE, used)
     if not api_succeeded(data):
         await reply(update, "Like request failed. Check the UID or try again later.")
         return
@@ -333,12 +410,28 @@ async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Likes After: {after}"
     )
     await reply(update, report)
+    group_report = (
+        "🎮 FX FF LIKE BD — LIKE REPORT\n\n"
+        f"👤 Player: {name}\n🆔 UID: {mask_uid(uid)}\n"
+        f"👍 Likes sent: {given}\n📊 Before: {before} → After: {after}\n"
+        f"⏳ Estimated time: {estimate_days(given)} day(s) at about 200 likes/day"
+    )
+    if not is_owner(update):
+        await send_log(context, group_report)
 
 async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update) or not update.message:
+    """Create a persistent order; no API request is made during order placement."""
+    user = update.effective_user
+    if not user or not update.message:
+        return
+    if not is_owner(update) and not is_authorized_group(update):
+        await reply(update, f"Use this command only in the authorized group.\nWebsite: {WEBSITE_URL}\nAdmin: {OWNER_URL}")
+        return
+    if not allowed(update):
+        await reply(update, "Public mode is currently OFF. Please contact the admin.")
         return
     if len(context.args) != 2 or not all(arg.isdigit() for arg in context.args):
-        await reply(update, "Incorrect format.\nCorrect: /order UID LIKE_AMOUNT\nExample: /order 123456789 5000")
+        await reply(update, "Incorrect command format.\nCorrect: /order UID LIKE_AMOUNT\nExample: /order 123456789 600")
         return
     uid, amount = context.args[0], int(context.args[1])
     if amount < 1 or amount > 20000:
@@ -352,7 +445,7 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "uid": uid,
             "requested": amount,
             "delivered": 0,
-            "created_by": update.effective_user.id,
+            "created_by": user.id,
             "created_at": datetime.now(TZ).isoformat(),
             "start_at": next_day_start(),
             "status": "queued",
@@ -362,19 +455,16 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         orders.append(order)
         write_json(ORDERS_FILE, orders)
-    
-    days_needed = estimate_days(amount)
     await reply(
         update,
-        "ORDER QUEUED SUCCESSFULLY\n\n"
-        f"Order ID: #{order_id}\n"
-        f"UID: {uid}\n"
-        f"Total Likes Requested: {amount}\n"
-        f"Estimated Duration: {days_needed} day(s) (about 200 likes/day)\n"
-        "Processing Start: Next 4:00 AM"
+        f"ORDER QUEUED\nOrder: #{order_id}\nUID: {mask_uid(uid)}\n"
+        f"Requested: {amount} likes\nEstimated duration: about {estimate_days(amount)} day(s), at 200 likes/day\n"
+        "First processing: next scheduled 4:00 AM Bangladesh time.\n"
+        "No API request has been made yet."
     )
 
 async def orderremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove pending queued orders for a UID. Restricted to the owner."""
     if not is_owner(update) or not update.message:
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
@@ -392,30 +482,29 @@ async def orderremove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if removed:
             write_json(ORDERS_FILE, kept)
     if removed:
-        await reply(update, f"ORDER REMOVED\n\nUID: {uid}\nRemoved Pending Orders: {removed}")
+        await reply(update, f"ORDER REMOVED\nUID: {mask_uid(uid)}\nRemoved pending orders: {removed}")
     else:
-        await reply(update, f"NO PENDING ORDER FOUND\n\nUID: {uid}")
+        await reply(update, f"NO PENDING ORDER FOUND\nUID: {mask_uid(uid)}")
 
 async def orderlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update) or not update.message:
+    """Owner-only list of every queued, completed, or errored order."""
+    if not update.message or not is_owner(update):
         return
     orders = read_json(ORDERS_FILE, [])
     if not orders:
-        await reply(update, "ORDER LIST\n\nNo orders found.")
+        await reply(update, "ORDER LIST\n\nNo orders found yet.")
         return
-    lines = [f"FX FF LIKE BD — ALL ORDERS ({len(orders)})\n"]
+    lines = [f"FX FF LIKE BD — ALL ORDERS ({len(orders)})", ""]
     for order in sorted(orders, key=lambda item: int(item.get("id", 0))):
         requested = int(order.get("requested", 0) or 0)
         delivered = int(order.get("delivered", 0) or 0)
         remaining = max(0, requested - delivered)
-        days_left = estimate_days(remaining)
         lines.append(
             f"Order #{order.get('id', '?')} | {str(order.get('status', 'unknown')).upper()}\n"
             f"UID: {order.get('uid', 'N/A')}\n"
             f"Player: {order.get('player_name', 'Pending')}\n"
-            f"Likes: {delivered}/{requested}\n"
-            f"Remaining: {remaining}\n"
-            f"Days Left: {days_left} day(s)\n"
+            f"Likes: {delivered}/{requested} | Remaining: {remaining}\n"
+            f"User ID: {order.get('created_by', 'N/A')}"
         )
     chunk = ""
     for entry in lines:
@@ -438,7 +527,7 @@ async def process_queued_orders(application):
 
         await asyncio.sleep(max(0, (target - now).total_seconds()))
 
-        admin_reports = []
+        admin_summary_logs = []
 
         async with ORDER_LOCK:
             orders = read_json(ORDERS_FILE, [])
@@ -457,11 +546,18 @@ async def process_queued_orders(application):
                     data = await send_like_api(uid)
 
                     if not api_succeeded(data):
-                        admin_reports.append(
-                            f"❌ Auto-Like Failed\n"
+                        admin_summary_logs.append(
+                            f"Player Name: {order.get('player_name', 'Pending')}\n"
                             f"UID: {uid}\n"
-                            f"Player: {order.get('player_name', 'Pending')}\n"
-                            f"Reason: API temporarily unavailable (will retry next 4:00 AM)"
+                            f"Likes Sent Today: 0\n"
+                            f"Status: API Unavailable (Next 04:00 Run)"
+                        )
+                        await send_log(
+                            application,
+                            "FX FF LIKE BD — AUTO-LIKE UPDATE\n\n"
+                            f"UID: {mask_uid(uid)}\n"
+                            "Status: API temporarily unavailable\n"
+                            "Next attempt: next scheduled 04:00 run"
                         )
                         continue
 
@@ -479,19 +575,28 @@ async def process_queued_orders(application):
                     write_json(ORDERS_FILE, orders)
 
                     days_left = estimate_days(remaining)
-                    # Line-by-line detailed report for Admin inbox
-                    single_report = (
-                        f"👤 Player Name: {name}\n"
-                        f"🆔 UID: {uid}\n"
-                        f"👍 Likes Sent Today: {given}\n"
-                        f"📊 Likes Before: {before}\n"
-                        f"📈 Likes After: {after}\n"
-                        f"🎯 Total Delivered: {order['delivered']} / {requested}\n"
-                        f"⏳ Remaining Likes: {remaining}\n"
-                        f"🗓 Days Left: {days_left} day(s)\n"
-                        f"📌 Status: {order['status'].upper()}"
+                    # Admin Inbox log format: unmasked UID, line by line with clear details
+                    order_log = (
+                        f"Player Name: {name}\n"
+                        f"UID: {uid}\n"
+                        f"Likes Sent Today: {given}\n"
+                        f"Likes Before: {before}\n"
+                        f"Likes After: {after}\n"
+                        f"Total Delivered: {order['delivered']} / {requested}\n"
+                        f"Remaining Likes: {remaining}\n"
+                        f"Days Left: {days_left} day(s)\n"
+                        f"Status: {order['status'].upper()}"
                     )
-                    admin_reports.append(single_report)
+                    admin_summary_logs.append(order_log)
+
+                    group_report = (
+                        "FX FF LIKE BD — DAILY AUTO-LIKE REPORT\n\n"
+                        f"Player: {name}\nUID: {mask_uid(uid)}\n"
+                        f"Likes sent today: {given}\nBefore: {before} → After: {after}\n"
+                        f"Total delivered: {order['delivered']} / {requested}\n"
+                        f"Estimated remaining time: {days_left} day(s), at about 200 likes/day"
+                    )
+                    await send_log(application, group_report)
                     await asyncio.sleep(1.5)
 
                 except asyncio.CancelledError:
@@ -501,14 +606,14 @@ async def process_queued_orders(application):
                     try:
                         write_json(ORDERS_FILE, orders)
                     except Exception:
-                        pass
+                        logger.exception("Could not save order data after processing error")
 
-        # Send daily logs directly to ADMIN inbox
-        if admin_reports:
-            full_header = f"📅 DAILY AUTO-LIKE REPORT (04:00 AM)\nTotal Processed: {len(admin_reports)}\n\n"
+        # Send daily detailed summary directly to ADMIN Inbox separated by enters
+        if admin_summary_logs:
+            full_header = f"FX FF LIKE BD — DAILY ORDERS LOGS ({len(admin_summary_logs)})\n\n"
             chunk = full_header
-            for report_text in admin_reports:
-                candidate = chunk + report_text + "\n\n────────────────\n\n"
+            for log_entry in admin_summary_logs:
+                candidate = chunk + log_entry + "\n\n────────────────\n\n"
                 if len(candidate) > 3500 and chunk:
                     try:
                         await application.bot.send_message(
@@ -519,7 +624,7 @@ async def process_queued_orders(application):
                         )
                     except Exception:
                         await application.bot.send_message(chat_id=ADMIN_ID, text=chunk.strip())
-                    chunk = report_text + "\n\n────────────────\n\n"
+                    chunk = log_entry + "\n\n────────────────\n\n"
                 else:
                     chunk = candidate
             if chunk.strip():
@@ -534,9 +639,13 @@ async def process_queued_orders(application):
                     await application.bot.send_message(chat_id=ADMIN_ID, text=chunk.strip())
 
 async def main_async():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing!")
-    app = Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_NEW_BOT_TOKEN_HERE":
+        raise RuntimeError("Open main.py and replace PASTE_YOUR_NEW_BOT_TOKEN_HERE with your new Telegram bot token.")
+
+    # Render network stability timeouts
+    req = HTTPXRequest(connect_timeout=35.0, read_timeout=35.0, write_timeout=35.0)
+    app = Application.builder().token(BOT_TOKEN).request(req).build()
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
@@ -548,9 +657,19 @@ async def main_async():
     app.add_handler(CommandHandler("public", public_cmd))
     app.add_handler(CommandHandler("offpublic", offpublic_cmd))
     app.add_error_handler(error_handler)
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    for attempt in range(5):
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            break
+        except Exception as exc:
+            logger.warning("Connecting attempt %s failed (%s). Retrying in 4s...", attempt + 1, exc)
+            if attempt == 4:
+                raise
+            await asyncio.sleep(4)
+
     asyncio.create_task(process_queued_orders(app))
     server = web.Application()
     async def health(_request):
@@ -567,11 +686,14 @@ async def main_async():
             health_server_started = True
             logger.info("Health server listening on port %s", port)
         except OSError as exc:
-            logger.warning("Health server could not bind port %s (%s). Continuing...", port, exc)
+            logger.warning(
+                "Health server could not bind port %s (%s). Continuing without HTTP health server.",
+                port, exc
+            )
     except Exception:
-        logger.exception("Could not initialize optional health server.")
+        logger.exception("Could not initialize optional health server; bot will continue.")
 
-    logger.info("FX FF LIKE BD started for ADMIN: %s", ADMIN_ID)
+    logger.info("FX FF LIKE BD started; authorized group=%s", AUTHORIZED_GROUP_ID)
     try:
         while True:
             await asyncio.sleep(3600)
