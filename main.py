@@ -42,7 +42,7 @@ from telegram.request import HTTPXRequest
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8823280270:AAF-auB09iS2j4mBRFOfQhN2cXYAdNLiL80").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6417430059"))
-API_URL = "https://autolike-frexy-api.vercel.app/like?"
+API_URL = "https://khankir-pula-aibar-curi-kor.vercel.app/like?"
 OWNER_URL = "https://t.me/Frexy1only"
 WEBSITE_URL = "https://fx-like-bd.vercel.app"
 LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "-1003765179070"))
